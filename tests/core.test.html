@@ -1,0 +1,126 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>photo-brighten browser tests</title>
+<style>body{font:13px/1.5 ui-monospace,Menlo,monospace;padding:16px}.p{color:#1d7a37}.f{color:#b3261e;font-weight:700}
+iframe{width:600px;height:300px;border:1px solid #ccc}</style>
+</head><body>
+<h1>photo-brighten — browser tests</h1>
+<p>Serve the project folder over HTTP (e.g. <code>python3 -m http.server 8765 --bind 127.0.0.1</code>) and open <code>/tests/core.test.html</code>.
+Uses only the generated images in <code>examples/sample-photos/</code>. Downloads are captured, not written to your Downloads folder.</p>
+<pre id="out">running…</pre>
+<div id="frames"></div>
+<script>
+(async function () {
+  const out = document.getElementById('out');
+  const results = [];
+  const html = await (await fetch('../batch-brighten.html', { cache: 'no-store' })).text();
+  const core = /<script id="core-logic">([\s\S]*?)<\/script>/.exec(html)[1];
+  const C = new Function(core + '\nreturn {outputTypeFor,isImageName,makeLut,applyLut,loadImage,renderCanvas,processOne,processAll};')();
+  const blobOf = async p => (await fetch(p, { cache: 'no-store' })).blob();
+  const S = '../examples/sample-photos/';
+
+  function eq(a, b, msg) { if (a !== b) throw new Error((msg ? msg + ': ' : '') + 'expected ' + JSON.stringify(b) + ', got ' + JSON.stringify(a)); }
+  function ok(v, msg) { if (!v) throw new Error(msg || 'expected truthy'); }
+  async function test(name, fn) {
+    try { await fn(); results.push({ name, pass: true }); }
+    catch (e) { results.push({ name, pass: false, err: String(e && e.message || e) }); }
+  }
+  async function pixels(blob) {
+    const bmp = await createImageBitmap(blob);
+    const c = document.createElement('canvas'); c.width = bmp.width; c.height = bmp.height;
+    const x = c.getContext('2d'); x.drawImage(bmp, 0, 0);
+    return { w: c.width, h: c.height, at: (px, py) => [...x.getImageData(px, py, 1, 1).data] };
+  }
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  async function waitFor(cond, ms) {
+    const end = Date.now() + (ms || 4000);
+    while (Date.now() < end) { if (cond()) return; await sleep(30); }
+    throw new Error('timeout waiting for UI');
+  }
+
+  await test('output format follows the extension: .png → PNG, .jpg/.jpeg/.JPG → JPEG', () => {
+    eq(C.outputTypeFor('a.PNG'), 'image/png'); eq(C.outputTypeFor('a.jpeg'), 'image/jpeg'); eq(C.outputTypeFor('b.JPG'), 'image/jpeg');
+  });
+  await test('hidden files and non-images are not processed', () => { eq(C.isImageName('._a.jpg'), false); eq(C.isImageName('a.gif'), false); eq(C.isImageName('A.JPG'), true); });
+  await test('LUT: 1.0/1.0 is identity; brightness multiplies and caps at 255; contrast pivots on mid-grey', () => {
+    const id = C.makeLut(1, 1); for (let v = 0; v < 256; v++) eq(id[v], v, 'identity ' + v);
+    eq(C.makeLut(1.5, 1)[100], 150); eq(C.makeLut(2, 1)[200], 255);
+    eq(C.makeLut(1, 2)[0], 0); eq(C.makeLut(1, 2)[255], 255); eq(C.makeLut(1, 2)[160], 193);
+  });
+  await test('PNG: transparent areas stay transparent, opaque areas are brightened', async () => {
+    const outBlob = await C.processOne(await blobOf(S + 'checker-alpha.png'), 'checker-alpha.png', 1.5, 1);
+    eq(outBlob.type, 'image/png');
+    const p = await pixels(outBlob);
+    eq(p.at(120, 80)[3], 0, 'hole alpha');
+    const edge = p.at(5, 5);
+    eq(edge[3], 255); eq(edge.slice(0, 3).join(','), '90,105,135');
+  });
+  await test('JPEG: output is JPEG', async () => {
+    const outBlob = await C.processOne(await blobOf(S + 'gradient-dark.jpg'), 'gradient-dark.jpg', 1.3, 1.06);
+    eq(outBlob.type, 'image/jpeg');
+  });
+  await test('PNG content named .jpg → JPEG output (extension and content agree)', async () => {
+    const outBlob = await C.processOne(await blobOf(S + 'checker-alpha.png'), 'renamed.jpg', 1.2, 1);
+    eq(outBlob.type, 'image/jpeg');
+  });
+  await test('EXIF orientation 6 is applied to the output pixels', async () => {
+    const outBlob = await C.processOne(await blobOf(S + 'rotated-exif6.jpg'), 'rotated-exif6.jpg', 1.2, 1);
+    const p = await pixels(outBlob);
+    eq(p.w + 'x' + p.h, '120x200');
+  });
+  await test('a failure is not a success: a broken file is counted as failed, the rest are written', async () => {
+    const written = [];
+    const r = await C.processAll([
+      { name: 'a.png', getBlob: () => blobOf(S + 'checker-alpha.png') },
+      { name: 'broken.jpg', getBlob: async () => new Blob(['not an image'], { type: 'image/jpeg' }) },
+      { name: 'b.jpg', getBlob: () => blobOf(S + 'gradient-dark.jpg') }
+    ], 1.2, 1, async (name, blob) => written.push(name + ':' + blob.type));
+    eq(r.ok, 2); eq(r.failed, 1); eq(r.failures[0].name, 'broken.jpg');
+    eq(written.join(','), 'a.png:image/png,b.jpg:image/jpeg');
+  });
+  await test('a write failure is also counted as failed', async () => {
+    const r = await C.processAll([{ name: 'a.png', getBlob: () => blobOf(S + 'checker-alpha.png') }], 1.2, 1,
+      async () => { throw new Error('disk full'); });
+    eq(r.ok, 0); eq(r.failed, 1);
+  });
+
+  // Safari path: no showDirectoryPicker → click opens the hidden file input → download mode.
+  await test('no folder API (Safari path): click opens the file picker, multi-select, one download per photo, right formats', async () => {
+    const noFS = html.replace('<head>', '<head><script>delete Window.prototype.showDirectoryPicker; delete window.showDirectoryPicker;<\/script>');
+    const f = document.createElement('iframe');
+    document.getElementById('frames').appendChild(f);
+    await new Promise(r => { f.onload = r; f.srcdoc = noFS; });
+    const w = f.contentWindow, d = w.document;
+    ok(!('showDirectoryPicker' in w), 'stub failed');
+    eq(d.getElementById('safariWarn').style.display, 'block');
+    let opened = 0; const origClick = w.HTMLInputElement.prototype.click;
+    w.HTMLInputElement.prototype.click = function () { if (this.id === 'drop_file') opened++; else origClick.call(this); };
+    d.getElementById('drop').click();
+    eq(opened, 1, 'hidden file input not opened');
+    const dt = new w.DataTransfer();
+    dt.items.add(new w.File([await blobOf(S + 'checker-alpha.png')], 'checker-alpha.png', { type: 'image/png' }));
+    dt.items.add(new w.File([await blobOf(S + 'gradient-dark.jpg')], 'gradient-dark.jpg', { type: 'image/jpeg' }));
+    dt.items.add(new w.File(['x'], 'notes.txt'));
+    const input = d.getElementById('drop_file');
+    input.files = dt.files; input.dispatchEvent(new w.Event('change'));
+    await waitFor(() => d.getElementById('count').textContent.includes('download mode'));
+    ok(d.getElementById('count').textContent.includes('Found 2 photo'), d.getElementById('count').textContent);
+    const downloads = [];
+    w.HTMLAnchorElement.prototype.click = function () { downloads.push({ name: this.download, href: this.href }); };
+    d.getElementById('go').click();
+    await waitFor(() => d.getElementById('msg').textContent.includes('failed (of'));
+    eq(downloads.map(x => x.name).join(','), 'checker-alpha.png,gradient-dark.jpg');
+    eq((await (await fetch(downloads[0].href)).blob()).type, 'image/png');
+    const msg = d.getElementById('msg').textContent;
+    ok(msg.includes('2 handed to the browser as downloads, 0 failed') && msg.includes('cannot confirm'), msg);
+    ok(!msg.includes('succeeded'), 'download mode must not claim the files were saved: ' + msg);
+  });
+
+  const failed = results.filter(r => !r.pass);
+  out.innerHTML = results.map(r => r.pass ? '<span class="p">PASS</span> ' + r.name
+    : '<span class="f">FAIL</span> ' + r.name + ' — ' + r.err.replace(/</g, '&lt;')).join('\n')
+    + '\n\n' + (results.length - failed.length) + '/' + results.length + ' passed';
+  document.title = (failed.length ? 'FAIL ' : 'PASS ') + (results.length - failed.length) + '/' + results.length;
+  window.__TEST_RESULTS__ = results;
+})();
+</script>
+</body></html>

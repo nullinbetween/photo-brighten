@@ -1,0 +1,244 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Batch Brighten</title>
+<style>
+:root{--ink:#1a2238;--accent:#2b5d8c;--line:#d8e0e8;--bg:#f4f7fa}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink);background:var(--bg)}
+header{background:#fff;border-bottom:1px solid var(--line);padding:16px 20px}
+h1{margin:0;font-size:18px}.sub{color:#6a7785;font-size:12px;margin-top:4px;line-height:1.6}
+main{max-width:760px;margin:0 auto;padding:18px}
+#drop{border:2.5px dashed var(--accent);border-radius:14px;background:#fff;padding:34px;text-align:center;cursor:pointer;transition:.15s}
+#drop.over{background:#eaf2fb;border-color:#1a4a78}
+#drop b{font-size:16px}.hint{color:#6a7785;font-size:12.5px;margin-top:8px;line-height:1.6}
+.panel{display:none;background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px;margin-top:16px}
+.row{display:flex;align-items:center;gap:12px;margin:12px 0}
+.row label{width:84px;font-weight:600;font-size:14px}.row input[type=range]{flex:1}
+.row .val{width:48px;text-align:right;font-variant-numeric:tabular-nums;color:var(--accent);font-weight:700}
+canvas{max-width:100%;max-height:380px;border-radius:10px;border:1px solid var(--line);display:block;margin:0 auto;
+  background:repeating-conic-gradient(#e6e6e6 0% 25%,#f8f8f8 0% 50%) 0 0/16px 16px}
+.btns{display:flex;gap:10px;margin-top:16px}
+button{border:none;border-radius:10px;padding:12px 18px;font-size:15px;font-weight:700;cursor:pointer}
+.go{background:var(--accent);color:#fff;flex:1}.go:disabled{opacity:.5;cursor:default}
+.ghost{background:#eef3f8;color:#516072}
+.bar{height:8px;background:#eef3f8;border-radius:5px;overflow:hidden;margin-top:14px;display:none}
+.bar>div{height:100%;width:0;background:var(--accent);transition:.1s}
+.msg{font-size:13px;color:#3a4859;margin-top:10px;min-height:18px;white-space:pre-line}
+.warn{background:#fff4e0;border-left:4px solid #e0a040;padding:8px 12px;border-radius:8px;font-size:12.5px;margin-top:10px;line-height:1.6}
+</style></head><body>
+<header><h1>💡 Batch Brighten</h1><div class="sub">Choose a folder → adjust with a live preview → one click writes <code>brighten/</code> inside it.
+Your photos are processed in this browser and never uploaded. JPG/JPEG/PNG only; the output keeps each file’s format (PNG keeps transparency);
+your originals are never modified.</div></header>
+<main>
+ <div id="drop">
+   <b>Drop a photo folder (or photo files) here</b>
+   <div class="hint" id="dropHint"></div>
+ </div>
+ <input type="file" id="drop_file" multiple accept="image/jpeg,image/png,.jpg,.jpeg,.png" style="display:none">
+ <div class="warn" id="safariWarn" style="display:none">⚠ This browser cannot write back into a folder (Safari, Firefox and others).
+   Click above to choose photo files (multi-select works) or drop them in; each brightened photo is handed to the browser as a download (normally into your Downloads folder).
+   The browser may ask once whether to allow multiple downloads. The page cannot see whether each download was saved, so check the folder afterwards;
+   how same-name files are handled is up to the browser (usually a number is added).</div>
+
+ <div class="panel" id="panel">
+   <canvas id="cv"></canvas>
+   <div class="row"><label for="bri">Brightness</label><input type="range" id="bri" min="0.5" max="2.5" step="0.01" value="1.45"><span class="val" id="briV">1.45</span></div>
+   <div class="row"><label for="con">Contrast</label><input type="range" id="con" min="0.5" max="2.0" step="0.01" value="1.06"><span class="val" id="conV">1.06</span></div>
+   <div class="msg" id="count"></div>
+   <div class="btns">
+     <button class="go" id="go">Process &amp; export</button>
+     <button class="ghost" id="reset">Start over</button>
+   </div>
+   <div class="bar" id="bar"><div id="fill"></div></div>
+   <div class="msg" id="msg"></div>
+ </div>
+</main>
+
+<script id="core-logic">
+/* ============ Core: no UI, testable on its own ============ */
+const IMG_RE = /\.(jpe?g|png)$/i;
+const OUT_DIRNAME = 'brighten';
+
+// Output format follows the extension: .png → PNG (keeps transparency), .jpg/.jpeg → JPEG at quality 0.95
+function outputTypeFor(name) { return /\.png$/i.test(name) ? 'image/png' : 'image/jpeg'; }
+function isImageName(name) { return IMG_RE.test(name) && !String(name).startsWith('.'); }
+
+// Brightness (multiply), then contrast around mid-grey; each step is clamped to 0–255. RGB only, alpha untouched.
+// Not done with the canvas ctx.filter: some browsers (Safari) ignore it, and the output would be unchanged.
+function makeLut(bri, con) {
+  const lut = new Uint8ClampedArray(256);
+  for (let v = 0; v < 256; v++) {
+    const b = Math.min(255, Math.max(0, v * bri));
+    lut[v] = Math.round((b - 127.5) * con + 127.5);
+  }
+  return lut;
+}
+function applyLut(imageData, lut) {
+  const d = imageData.data;
+  for (let i = 0; i < d.length; i += 4) { d[i] = lut[d[i]]; d[i + 1] = lut[d[i + 1]]; d[i + 2] = lut[d[i + 2]]; }
+  return imageData;
+}
+
+// Blob → <img>; rejects when the image cannot be decoded (instead of waiting forever)
+function loadImage(blob) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const im = new Image();
+    im.onload = () => { URL.revokeObjectURL(url); resolve(im); };
+    im.onerror = () => { URL.revokeObjectURL(url); reject(new Error('cannot decode the image')); };
+    im.src = url;
+  });
+}
+// Draw onto a canvas and apply brightness/contrast; maxW is for the preview
+function renderCanvas(img, bri, con, canvas, maxW) {
+  const s = maxW ? Math.min(1, maxW / img.naturalWidth) : 1;
+  const c = canvas || document.createElement('canvas');
+  c.width = Math.max(1, Math.round(img.naturalWidth * s));
+  c.height = Math.max(1, Math.round(img.naturalHeight * s));
+  const x = c.getContext('2d');
+  x.clearRect(0, 0, c.width, c.height);
+  x.drawImage(img, 0, 0, c.width, c.height);
+  const data = x.getImageData(0, 0, c.width, c.height);
+  x.putImageData(applyLut(data, makeLut(bri, con)), 0, 0);
+  return c;
+}
+function canvasToBlob(c, type) {
+  return new Promise(res => c.toBlob(b => res(b), type, type === 'image/jpeg' ? 0.95 : undefined));
+}
+async function processOne(blob, name, bri, con) {
+  const img = await loadImage(blob);
+  const out = await canvasToBlob(renderCanvas(img, bri, con), outputTypeFor(name));
+  if (!out) throw new Error('cannot export (the image may be too large)');
+  return out;
+}
+// list: [{name, getBlob}]; write(name, blob). A failure does not stop the batch; each file is counted.
+async function processAll(list, bri, con, write, onProgress) {
+  let ok = 0;
+  const failures = [];
+  for (let i = 0; i < list.length; i++) {
+    try {
+      const out = await processOne(await list[i].getBlob(), list[i].name, bri, con);
+      await write(list[i].name, out);
+      ok++;
+    } catch (e) {
+      failures.push({ name: list[i].name, msg: String(e && e.message || e) });
+    }
+    if (onProgress) onProgress(i + 1, list.length);
+  }
+  return { ok, failed: failures.length, failures };
+}
+</script>
+
+<script>
+const $ = id => document.getElementById(id);
+const hasFS = 'showDirectoryPicker' in window;
+let dirHandle = null, files = [], previewImg = null, fallbackFiles = null, overwriteCount = 0;
+
+$('dropHint').textContent = hasFS
+  ? 'Or click here to choose a folder. Only JPG/PNG at the top level of the folder are processed (not subfolders); results go to brighten/ inside it.'
+  : 'Or click here to choose photo files (multi-select works). This browser can only use download mode.';
+if (!hasFS) $('safariWarn').style.display = 'block';
+
+$('bri').oninput = () => { $('briV').textContent = (+$('bri').value).toFixed(2); draw(); };
+$('con').oninput = () => { $('conV').textContent = (+$('con').value).toFixed(2); draw(); };
+
+function draw() {
+  if (!previewImg) return;
+  renderCanvas(previewImg, +$('bri').value, +$('con').value, $('cv'), 700);
+}
+async function loadPreview(blob) {
+  try { previewImg = await loadImage(blob); draw(); }
+  catch (e) { previewImg = null; $('msg').textContent = 'Cannot preview the first photo: ' + e.message; }
+}
+
+// Folder mode: top-level images only; first count same-name files in brighten/ that will be overwritten
+async function useDirectory(h) {
+  dirHandle = h; fallbackFiles = null; files = [];
+  for await (const [name, fh] of h.entries()) if (fh.kind === 'file' && isImageName(name)) files.push({ name, h: fh });
+  if (!files.length) { $('msg').textContent = 'No JPG/PNG at the top level of this folder.'; return; }
+  files.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  overwriteCount = 0;
+  try {
+    const sub = await h.getDirectoryHandle(OUT_DIRNAME);
+    const names = new Set(files.map(f => f.name));
+    for await (const [name, fh] of sub.entries()) if (fh.kind === 'file' && names.has(name)) overwriteCount++;
+  } catch (e) { /* brighten/ does not exist yet */ }
+  await loadPreview(await files[0].h.getFile());
+  $('count').textContent = `Found ${files.length} photo(s) (top level only). Adjust the sliders, then export to brighten/.`
+    + (overwriteCount ? `\n⚠ brighten/ already has ${overwriteCount} file(s) with the same name; they will be overwritten.` : '');
+  $('panel').style.display = 'block'; $('msg').textContent = '';
+}
+function useFiles(list) {
+  const fl = list.filter(f => isImageName(f.name));
+  if (!fl.length) {
+    $('msg').textContent = 'No JPG/PNG found.' + (hasFS ? '' : ' (This browser cannot take a dropped folder; drop or choose photo files instead.)');
+    $('panel').style.display = 'block'; return;
+  }
+  fallbackFiles = fl; dirHandle = null; overwriteCount = 0;
+  loadPreview(fl[0]);
+  $('count').textContent = `Found ${fl.length} photo(s) (download mode).`;
+  $('panel').style.display = 'block'; $('msg').textContent = '';
+}
+
+async function pickDir() {
+  try { await useDirectory(await window.showDirectoryPicker()); }
+  catch (e) { /* cancelled */ }
+}
+$('drop').onclick = () => { if (hasFS) pickDir(); else $('drop_file').click(); };
+$('drop_file').addEventListener('change', () => { useFiles([...$('drop_file').files]); $('drop_file').value = ''; });
+
+$('drop').addEventListener('dragover', e => { e.preventDefault(); $('drop').classList.add('over'); });
+$('drop').addEventListener('dragleave', () => $('drop').classList.remove('over'));
+$('drop').addEventListener('drop', async e => {
+  e.preventDefault(); $('drop').classList.remove('over');
+  const item = e.dataTransfer.items && e.dataTransfer.items[0];
+  if (hasFS && item && item.getAsFileSystemHandle) {
+    const h = await item.getAsFileSystemHandle();
+    if (h && h.kind === 'directory') { await useDirectory(h); return; }
+  }
+  useFiles([...e.dataTransfer.files]);   // dropped files → download mode
+});
+
+function downloadBlob(name, blob) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+$('go').onclick = async () => {
+  const bri = +$('bri').value, con = +$('con').value;
+  const list = dirHandle
+    ? files.map(f => ({ name: f.name, getBlob: () => f.h.getFile() }))
+    : (fallbackFiles || []).map(f => ({ name: f.name, getBlob: async () => f }));
+  if (!list.length) return;
+  $('go').disabled = true; $('bar').style.display = 'block'; $('fill').style.width = '0';
+  let write = async (name, blob) => downloadBlob(name, blob);
+  try {
+    if (dirHandle) {
+      const sub = await dirHandle.getDirectoryHandle(OUT_DIRNAME, { create: true });
+      write = async (name, blob) => {
+        const fh = await sub.getFileHandle(name, { create: true });
+        const w = await fh.createWritable(); await w.write(blob); await w.close();
+      };
+    }
+  } catch (e) {
+    $('msg').textContent = 'Cannot create brighten/: ' + e.message; $('go').disabled = false; return;
+  }
+  const r = await processAll(list, bri, con, write, (done, total) => {
+    $('fill').style.width = (done / total * 100) + '%';
+    $('msg').textContent = `Working… ${done}/${total}`;
+  });
+  // Folder mode knows each file was written. Download mode only knows the browser was asked to download it.
+  $('msg').textContent = (dirHandle
+      ? `${r.failed ? '⚠' : '✅'} ${r.ok} succeeded, ${r.failed} failed (of ${list.length}) → brighten/ in your folder`
+      : `${r.failed ? '⚠' : '✅'} ${r.ok} handed to the browser as downloads, ${r.failed} failed (of ${list.length}).`
+        + `\nThe page cannot confirm each download was saved — check your Downloads folder.`)
+    + (dirHandle && overwriteCount ? `\nExisting same-name files were overwritten (${overwriteCount} before this run).` : '')
+    + (r.failed ? '\nFailed: ' + r.failures.map(f => `${f.name} (${f.msg})`).join(', ') : '');
+  $('go').disabled = false;
+};
+$('reset').onclick = () => {
+  $('panel').style.display = 'none'; previewImg = null; files = []; dirHandle = null; fallbackFiles = null;
+  overwriteCount = 0; $('msg').textContent = ''; $('count').textContent = ''; $('fill').style.width = '0';
+};
+</script></body></html>

@@ -1,0 +1,4 @@
+.DS_Store
+__pycache__/
+# outputs created when trying the tool on the samples
+brighten/
